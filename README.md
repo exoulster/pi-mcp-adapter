@@ -395,7 +395,7 @@ On Linux, if credential access fails because Pi inherited a revoked session keyr
 mcp({ action: "auth-start", server: "linear-server" })
 ```
 
-Open the returned authorization URL in your local browser. After approval, your browser redirects to a localhost URL. On a remote server that local page may fail to load; copy the full URL from the browser address bar anyway and complete the flow in the same Pi session:
+For a loopback redirect, the adapter attempts to open the returned authorization URL, watches the callback, completes token exchange, and sends an `mcp-oauth-status` event when authentication finishes. If Pi is remote or cannot open a browser, open the returned URL locally. If the browser cannot reach Pi's callback, copy the full localhost URL from the address bar and complete the flow in the same Pi session:
 
 ```js
 mcp({
@@ -866,7 +866,7 @@ Servers that provide usage guidance via the MCP `instructions` field surface it 
 
 If `settings.autoAuth` is `true`, `mcp({ connect: ... })`, `mcp({ tool: ... })`, and direct tool calls automatically run OAuth when needed and retry once.
 
-In interactive sessions, you can also authenticate from `/mcp` with `ctrl+a` or Enter on a server that needs auth. In remote/headless sessions, use the proxy tool's `auth-start` and `auth-complete` actions to copy the authorization URL locally and paste the redirect URL back into Pi. `/mcp-auth` without a server only opens a picker in the interactive UI.
+In interactive sessions, you can also authenticate from `/mcp` with `ctrl+a` or Enter on a server that needs auth. The proxy tool's `auth-start` action opens and watches reachable loopback flows automatically. In remote/headless sessions, or for pre-registered HTTPS callbacks that the adapter cannot observe, use `auth-complete` to paste the full redirect URL back into Pi. `/mcp-auth` without a server only opens a picker in the interactive UI.
 
 ### MCP output schemas
 
