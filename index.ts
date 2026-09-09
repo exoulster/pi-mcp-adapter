@@ -1,4 +1,4 @@
-import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
+import { withFileMutationQueue, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { resolve } from "node:path";
 import type { McpExtensionState } from "./state.ts";
 import type { DirectToolSpec, McpAdapterOptions, McpConfig, PromptMetadata, ServerEntry } from "./types.ts";
@@ -6,9 +6,9 @@ import type { McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { Type } from "typebox";
 import type { TSchema } from "typebox";
 import { showStatus, showTools, showPrompts, reconnectServer, reconnectServers, authenticateServer, logoutServer, manageBearerToken, openMcpAuthPanel, openMcpPanel, openMcpSetup } from "./commands.ts";
-import { cloneMcpConfig, discoverConfiguredClaudePluginSkills, loadMcpConfig, resolveConfiguredClaudePluginMcp, writeProjectServerDisabledOverride } from "./config.ts";
+import { cloneMcpConfig, discoverConfiguredClaudePluginSkills, getPiGlobalConfigPath, getProjectConfigPath, loadMcpConfig, resolveConfiguredClaudePluginMcp, writeProjectServerDisabledOverride, writeSharedServerEntry } from "./config.ts";
 import { buildProxyDescription, createDirectToolExecutor, getMissingConfiguredDirectToolServers, prepareDirectToolArguments, resolveDirectTools } from "./direct-tools.ts";
-import { flushMetadataCache, initializeMcp, updateStatusBar } from "./init.ts";
+import { clearFailure, flushMetadataCache, initializeMcp, updateStatusBar } from "./init.ts";
 import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
 import { loadMetadataCache, parseDirectToolSelectors, type MetadataCache } from "./metadata-cache.ts";
 import { createPromptCommand, resolveCachedPrompts } from "./prompts.ts";
@@ -24,6 +24,7 @@ import { runMcpScript } from "./mcp-code.ts";
 import { cleanupMaterializedBinaryResources } from "./tool-registrar.ts";
 import { syncNamespaceProxyTools } from "./namespace-tools.ts";
 import { restoreSessionApprovalState } from "./session-approvals.ts";
+import { canonicalMcpServerUrl, normalizeMcpInstallRequest } from "./mcp-install.ts";
 
 export type { McpAdapterOptions } from "./types.ts";
 export type { ServerEntry } from "./types.ts";
@@ -1166,12 +1167,147 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     });
   }
 
+  async function executeInstall(
+    targetState: McpExtensionState,
+    rawUrl: string | undefined,
+    requestedName: string | undefined,
+    target: string | undefined,
+    cwd: string,
+    signal?: AbortSignal,
+  ) {
+    if (programmaticConfig) {
+      return {
+        content: [{ type: "text" as const, text: "MCP install is unavailable when the adapter uses programmatic configuration." }],
+        details: { mode: "install", error: "programmatic_config" },
+      };
+    }
+    if (target !== undefined && target !== "global" && target !== "project") {
+      return {
+        content: [{ type: "text" as const, text: "MCP install target must be 'global' or 'project'." }],
+        details: { mode: "install", error: "invalid_target" },
+      };
+    }
+
+    let normalized: ReturnType<typeof normalizeMcpInstallRequest>;
+    try {
+      normalized = normalizeMcpInstallRequest({
+        url: rawUrl ?? "",
+        ...(requestedName !== undefined ? { serverName: requestedName } : {}),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Failed to install MCP server: ${message}` }],
+        details: { mode: "install", error: "invalid_request", message },
+      };
+    }
+
+    const matchingUrl = Object.entries(targetState.config.mcpServers).find(([, definition]) =>
+      definition.url !== undefined && canonicalMcpServerUrl(definition.url) === normalized.url,
+    );
+    const serverName = requestedName?.trim() || matchingUrl?.[0] || normalized.serverName;
+    const existing = targetState.config.mcpServers[serverName];
+    if (existing && canonicalMcpServerUrl(existing.url ?? "") !== normalized.url) {
+      return {
+        content: [{ type: "text" as const, text: `MCP server name "${serverName}" is already configured with a different endpoint.` }],
+        details: { mode: "install", error: "name_conflict", server: serverName, url: normalized.url },
+      };
+    }
+
+    const persistedEntry: ServerEntry = { url: normalized.url };
+    const runtimeEntry: ServerEntry = existing ?? { ...persistedEntry, directTools: false };
+    const provisional = existing === undefined;
+    const persistenceRequired = provisional || runtimeServers.has(serverName);
+    if (provisional) {
+      targetState.config.mcpServers[serverName] = runtimeEntry;
+      attachRuntimeServerLifecycle(targetState, serverName, runtimeEntry);
+      syncToolSurface();
+      updateStatusBar(targetState);
+    }
+
+    const rollback = async (): Promise<void> => {
+      if (!provisional || targetState.config.mcpServers[serverName] !== runtimeEntry) return;
+      delete targetState.config.mcpServers[serverName];
+      targetState.lifecycle.unregisterServer(serverName);
+      await targetState.manager.close(serverName);
+      clearFailure(targetState, serverName, "install-rollback");
+      syncToolSurface();
+      updateStatusBar(targetState);
+    };
+
+    const connectResult = signal
+      ? await executeConnect(targetState, serverName, signal)
+      : await executeConnect(targetState, serverName);
+    const connectDetails = connectResult.details as { error?: string } | undefined;
+    const connectText = connectResult.content.find((content) => content.type === "text")?.text;
+    if (connectDetails?.error && connectDetails.error !== "auth_required") {
+      await rollback();
+      return {
+        content: [{ type: "text" as const, text: `MCP installation validation failed for "${serverName}". ${connectText ?? "Connection failed."}` }],
+        details: { mode: "install", error: "validation_failed", server: serverName, url: normalized.url },
+      };
+    }
+
+    let persistedPath: string | undefined;
+    if (persistenceRequired) {
+      persistedPath = target === "project" ? getProjectConfigPath(cwd) : getPiGlobalConfigPath(earlyConfigPath);
+      try {
+        await withFileMutationQueue(persistedPath, async () => {
+          writeSharedServerEntry(persistedPath!, serverName, persistedEntry);
+        });
+      } catch (error) {
+        await rollback();
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text" as const, text: `MCP server validation succeeded, but configuration could not be saved: ${message}` }],
+          details: { mode: "install", error: "persistence_failed", server: serverName, url: normalized.url, message },
+        };
+      }
+    }
+
+    if (connectDetails?.error === "auth_required") {
+      const authResult = signal
+        ? await executeAuthStart(targetState, serverName, signal)
+        : await executeAuthStart(targetState, serverName);
+      const authDetails = authResult.details as { error?: string } | undefined;
+      const authText = authResult.content.find((content) => content.type === "text")?.text;
+      return {
+        content: [{
+          type: "text" as const,
+          text: `${persistenceRequired ? "Installed" : "Found"} MCP server "${serverName}" at ${normalized.url}.\n\n${authText ?? "OAuth authorization is required."}`,
+        }],
+        details: {
+          mode: "install",
+          status: authDetails?.error ? "auth_start_failed" : "awaiting_auth",
+          server: serverName,
+          url: normalized.url,
+          ...(persistedPath ? { path: persistedPath } : {}),
+          ...(authDetails?.error ? { error: authDetails.error } : {}),
+        },
+      };
+    }
+
+    return {
+      content: [{
+        type: "text" as const,
+        text: `${persistenceRequired ? "Installed and connected" : "Already installed; connected"} MCP server "${serverName}" at ${normalized.url}.\n\n${connectText ?? ""}`.trim(),
+      }],
+      details: {
+        mode: "install",
+        status: "connected",
+        server: serverName,
+        url: normalized.url,
+        ...(persistedPath ? { path: persistedPath } : {}),
+      },
+    };
+  }
+
   function registerProxyTool(description: string): void {
     (pi.registerTool as (tool: unknown) => unknown)({
       name: "mcp",
       label: "MCP",
       description,
-      promptSnippet: "MCP gateway — status, search, describe, auth, and single MCP tool calls",
+      promptSnippet: "MCP gateway — install by URL, status, search, describe, auth, and single MCP tool calls",
       renderShell: toolRenderShell,
       renderCall: createMcpProxyToolCallRenderer(toolRenderOptions),
       parameters: Type.Object({
@@ -1191,8 +1327,10 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         includeSchemas: Type.Optional(Type.Boolean({ description: "Include parameter schemas in search results (default: true)" })),
         limit: optionalNumber({ minimum: 1, description: "Maximum search results to return (default: 12)" }),
         offset: optionalNumber({ minimum: 0, description: "Search result offset (default: 0)" }),
-        server: Type.Optional(Type.String({ description: "Filter to specific server (also disambiguates tool calls)" })),
-        action: Type.Optional(Type.String({ description: "Action: 'ui-messages', 'auth-start', or 'auth-complete'" })),
+        server: Type.Optional(Type.String({ description: "Server name (filters/disambiguates calls and optionally names an install)" })),
+        action: Type.Optional(Type.String({ description: "Action: 'install', 'ui-messages', 'auth-start', or 'auth-complete'" })),
+        url: Type.Optional(Type.String({ description: "MCP endpoint URL for action: 'install'" })),
+        target: Type.Optional(Type.String({ description: "Install target: 'global' (default) or 'project'" })),
       }),
       renderResult: renderMcpToolResult,
       async execute(_toolCallId: string, params: {
@@ -1208,6 +1346,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         offset?: number;
         server?: string;
         action?: string;
+        url?: string;
+        target?: string;
       }, signal: AbortSignal | undefined, _onUpdate: AgentToolUpdateCallback<Record<string, unknown>> | undefined, _ctx: ExtensionContext) {
         let executeOwner = currentOwner;
         const parseArgs = (value: string | Record<string, unknown> | undefined): Record<string, unknown> | undefined => {
@@ -1240,7 +1380,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           || value.instructions !== undefined
           || value.search !== undefined
           || value.server !== undefined
-          || value.action !== undefined;
+          || value.action !== undefined
+          || value.url !== undefined
+          || value.target !== undefined;
         if (!hasGatewayMode(params) && params.args !== undefined) {
           throw new Error("Gateway params were nested inside `args`; pass them top-level (for example, mcp({ search: \"...\" }) or mcp({ tool: \"...\", args: {} })).");
         }
@@ -1280,6 +1422,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         }
         executeOwner?.throwIfInactive();
 
+        if (params.action === "install") {
+          return executeInstall(state, params.url, params.server, params.target, _ctx.cwd, signal);
+        }
         if (params.action === "ui-messages") {
           return executeUiMessages(state);
         }

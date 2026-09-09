@@ -114,7 +114,7 @@ describe("manual OAuth proxy actions", () => {
     expect(state.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         customType: "mcp-oauth-status",
-        details: { server: "demo", status: "authenticated" },
+        details: expect.objectContaining({ server: "demo", status: "authenticated" }),
       }),
       { triggerTurn: true },
     );

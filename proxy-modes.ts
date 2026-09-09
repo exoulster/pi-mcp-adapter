@@ -137,7 +137,11 @@ function emitAuthStatus(state: McpExtensionState, serverName: string, status: "a
       customType: "mcp-oauth-status",
       content: [{ type: "text", text: message }],
       display: message,
-      details: { server: serverName, status },
+      details: {
+        server: serverName,
+        status,
+        ...(status === "authenticated" ? { nextAction: { connect: serverName } } : {}),
+      },
     },
     { triggerTurn: true },
   );
@@ -170,7 +174,7 @@ function ensureBackgroundAuthWatcher(
       state,
       serverName,
       "authenticated",
-      `OAuth authentication completed for MCP server "${serverName}".`,
+      `OAuth authentication completed for MCP server "${serverName}". Connect it now to load and verify its tools.`,
     );
   });
   watchers.set(serverName, watcher);

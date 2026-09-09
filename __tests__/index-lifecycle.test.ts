@@ -6,6 +6,7 @@ import { MCP_APPROVAL_CUSTOM_TYPE, getToolApprovalIdentity, makeToolApprovalKey 
 
 const mocks = vi.hoisted(() => ({
   initializeMcp: vi.fn(),
+  clearFailure: vi.fn(),
   updateStatusBar: vi.fn(),
   flushMetadataCache: vi.fn(),
   notifyToolMetadataUpdated: vi.fn(),
@@ -32,6 +33,9 @@ const mocks = vi.hoisted(() => ({
   openMcpAuthPanel: vi.fn(),
   openMcpPanel: vi.fn(),
   openMcpSetup: vi.fn(),
+  getPiGlobalConfigPath: vi.fn(() => "/tmp/agent/mcp.json"),
+  getProjectConfigPath: vi.fn(() => "/tmp/project/.mcp.json"),
+  writeSharedServerEntry: vi.fn((path: string) => path),
   writeProjectServerDisabledOverride: vi.fn(() => ({ path: "/tmp/project/.pi/mcp.json", changed: true })),
   executeAuthComplete: vi.fn(),
   executeAuthStart: vi.fn(),
@@ -51,6 +55,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../init.ts", () => ({
   initializeMcp: mocks.initializeMcp,
+  clearFailure: mocks.clearFailure,
   updateStatusBar: mocks.updateStatusBar,
   flushMetadataCache: mocks.flushMetadataCache,
   notifyToolMetadataUpdated: mocks.notifyToolMetadataUpdated,
@@ -67,6 +72,9 @@ vi.mock("../config.ts", () => ({
   cloneMcpConfig: mocks.cloneMcpConfig,
   discoverConfiguredClaudePluginSkills: mocks.discoverConfiguredClaudePluginSkills,
   resolveConfiguredClaudePluginMcp: mocks.resolveConfiguredClaudePluginMcp,
+  getPiGlobalConfigPath: mocks.getPiGlobalConfigPath,
+  getProjectConfigPath: mocks.getProjectConfigPath,
+  writeSharedServerEntry: mocks.writeSharedServerEntry,
   writeProjectServerDisabledOverride: mocks.writeProjectServerDisabledOverride,
 }));
 
@@ -133,10 +141,12 @@ function createDeferred<T>() {
 
 function createState() {
   return {
-    manager: { getAllConnections: () => new Map(), getConnection: vi.fn(() => undefined) },
+    manager: { close: vi.fn().mockResolvedValue(undefined), getAllConnections: () => new Map(), getConnection: vi.fn(() => undefined) },
     lifecycle: {
       gracefulShutdown: vi.fn().mockResolvedValue(undefined),
       ensureConverged: vi.fn().mockResolvedValue(undefined),
+      registerServer: vi.fn(),
+      unregisterServer: vi.fn(),
     },
     toolMetadata: new Map(),
     directToolCounts: new Map(),
@@ -278,6 +288,9 @@ describe("mcpAdapter session lifecycle", () => {
     });
     mocks.getMissingConfiguredDirectToolServers.mockReturnValue([]);
     mocks.resolveDirectTools.mockReturnValue([]);
+    mocks.getPiGlobalConfigPath.mockReturnValue("/tmp/agent/mcp.json");
+    mocks.getProjectConfigPath.mockReturnValue("/tmp/project/.mcp.json");
+    mocks.writeSharedServerEntry.mockImplementation((path: string) => path);
     mocks.getConfigPathFromArgv.mockReturnValue(undefined);
     mocks.normalizeDirectToolInputSchema.mockImplementation((schema: unknown) => schema && typeof schema === "object" && !Array.isArray(schema)
       ? Object.fromEntries(Object.entries(schema).filter(([key]) => key !== "$schema" && key !== "additionalProperties"))
@@ -873,6 +886,128 @@ describe("mcpAdapter session lifecycle", () => {
     expect(mocks.executeConnect).toHaveBeenCalledWith(state, "demo", undefined);
     expect(mocks.reconnectServers).toHaveBeenCalledWith(state, expect.any(Object), "demo");
     expect(mocks.resolveDirectTools).toHaveBeenCalledTimes(callsAfterInitialSync);
+  });
+
+  it("installs and connects a validated MCP URL without reloading", async () => {
+    const state = createState();
+    mocks.initializeMcp.mockResolvedValue(state);
+    mocks.executeConnect.mockResolvedValue({
+      content: [{ type: "text", text: "demo (1 tool)" }],
+      details: { mode: "connect", server: "demo" },
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    const result = await proxyTool.execute(
+      "call-install",
+      { action: "install", url: "https://demo.example.com/mcp", server: "demo" },
+      undefined,
+      undefined,
+      { cwd: "/tmp/project" },
+    );
+
+    expect(mocks.executeConnect).toHaveBeenCalledWith(state, "demo");
+    expect(state.config.mcpServers.demo).toEqual({ url: "https://demo.example.com/mcp", directTools: false });
+    expect(state.lifecycle.registerServer).toHaveBeenCalledWith("demo", state.config.mcpServers.demo, undefined);
+    expect(mocks.writeSharedServerEntry).toHaveBeenCalledWith(
+      "/tmp/agent/mcp.json",
+      "demo",
+      { url: "https://demo.example.com/mcp" },
+    );
+    expect(result.details).toMatchObject({ mode: "install", status: "connected", server: "demo" });
+  });
+
+  it("persists an OAuth MCP URL and starts watched authorization", async () => {
+    const state = createState();
+    mocks.initializeMcp.mockResolvedValue(state);
+    mocks.executeConnect.mockResolvedValue({
+      content: [{ type: "text", text: "authentication required" }],
+      details: { mode: "connect", error: "auth_required", server: "forex" },
+    });
+    mocks.executeAuthStart.mockResolvedValue({
+      content: [{ type: "text", text: "opening authorization URL" }],
+      details: { mode: "auth-start", server: "forex", authorizationUrl: "https://identity.example.com/authorize" },
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+
+    const result = await proxyTool.execute(
+      "call-install",
+      { action: "install", url: "https://forex-dev.1above.io/mcp", server: "forex", target: "project" },
+      undefined,
+      undefined,
+      { cwd: "/tmp/project" },
+    );
+
+    expect(mocks.writeSharedServerEntry).toHaveBeenCalledWith(
+      "/tmp/project/.mcp.json",
+      "forex",
+      { url: "https://forex-dev.1above.io/mcp" },
+    );
+    expect(mocks.executeAuthStart).toHaveBeenCalledWith(state, "forex");
+    expect(result.details).toMatchObject({ mode: "install", status: "awaiting_auth", server: "forex" });
+  });
+
+  it("reuses the configured name for an already installed URL", async () => {
+    const config = { mcpServers: { forex: { url: "https://forex-dev.1above.io/mcp", oauth: { scope: "forex:read" } } } };
+    const state = createState();
+    state.config = config;
+    mocks.loadMcpConfig.mockReturnValue(config);
+    mocks.initializeMcp.mockResolvedValue(state);
+    mocks.executeConnect.mockResolvedValue({ content: [{ type: "text", text: "connected" }], details: { mode: "connect" } });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+    const result = await proxyTool.execute(
+      "call-install",
+      { action: "install", url: "https://forex-dev.1above.io/mcp" },
+      undefined,
+      undefined,
+      { cwd: "/tmp/project" },
+    );
+
+    expect(mocks.executeConnect).toHaveBeenCalledWith(state, "forex");
+    expect(mocks.writeSharedServerEntry).not.toHaveBeenCalled();
+    expect(result.details).toMatchObject({ mode: "install", status: "connected", server: "forex" });
+  });
+
+  it("rolls back provisional runtime state when endpoint validation fails", async () => {
+    const state = createState();
+    mocks.initializeMcp.mockResolvedValue(state);
+    mocks.executeConnect.mockResolvedValue({
+      content: [{ type: "text", text: "connection failed" }],
+      details: { mode: "connect", error: "connect_failed" },
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+    await handlers.get("session_start")?.({}, {});
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+    const result = await proxyTool.execute(
+      "call-install",
+      { action: "install", url: "https://invalid.example.com/mcp", server: "invalid" },
+      undefined,
+      undefined,
+      { cwd: "/tmp/project" },
+    );
+
+    expect(state.config.mcpServers.invalid).toBeUndefined();
+    expect(state.lifecycle.unregisterServer).toHaveBeenCalledWith("invalid");
+    expect(state.manager.close).toHaveBeenCalledWith("invalid");
+    expect(mocks.writeSharedServerEntry).not.toHaveBeenCalled();
+    expect(result.details).toMatchObject({ mode: "install", error: "validation_failed" });
   });
 
   it("reports direct tools discovered by proxy connect as addedToolNames without rewriting active tools", async () => {

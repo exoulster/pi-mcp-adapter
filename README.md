@@ -383,6 +383,18 @@ To share one stdio MCP server across Pi sessions, run it under [`rmcp-mux`](http
 
 The adapter owns only its client socket and closes that connection when the Pi runtime stops. `rmcp-mux` owns the upstream process, request routing, initialization cache, restart policy, client limits, and socket permissions. Start and configure the mux separately; the adapter never discovers, starts, adopts, or stops its daemon. A socket is an explicit trusted local endpoint, so do not point unrelated projects or users at a mux service unless its tools, state, credentials, and filesystem access are intended to be shared.
 
+### Install from one URL
+
+When a user supplies an MCP endpoint URL, the agent can complete setup through the gateway without editing configuration by hand:
+
+```js
+mcp({ action: "install", url: "https://example.com/mcp" })
+```
+
+The install action validates the endpoint, reuses a server already configured at the same URL or derives a stable name from the hostname, connects it in the current runtime, and persists it to Pi's global MCP config. Pass `server` to choose a name or `target: "project"` to write `.mcp.json` in the current project instead. Unsafe URLs, name collisions, and endpoints that fail MCP connection validation are not persisted.
+
+Public servers are ready immediately. For OAuth servers, the same action opens the authorization page and watches a reachable loopback callback. After the user grants consent, an `mcp-oauth-status` message returns the agent to connect the server and verify its discovered tools. Remote/headless callbacks retain the manual completion fallback below.
+
 ### Remote/headless OAuth
 
 If Pi is running on a remote server, `/mcp-auth <server>` shows a clickable authorization URL first. Open it in your local browser and approve access, then select **Yes** in Pi to open the callback input. The browser may fail to load the localhost callback page because localhost refers to your workstation; copy the full URL from its address bar and paste it into Pi. The authorization screen closes automatically instead when the browser can reach Pi's callback directly.
