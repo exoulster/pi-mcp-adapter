@@ -961,7 +961,7 @@ describe("mcpAdapter session lifecycle", () => {
       "forex",
       { url: "https://forex-dev.1above.io/mcp" },
     );
-    expect(mocks.executeAuthStart).toHaveBeenCalledWith(state, "forex");
+    expect(mocks.executeAuthStart).toHaveBeenCalledWith(state, "forex", undefined);
     expect(result.details).toMatchObject({ mode: "install", status: "awaiting_auth", server: "forex" });
     expect(result.details.path).toBe("/tmp/project/.mcp.json");
   });

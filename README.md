@@ -385,13 +385,13 @@ The adapter owns only its client socket and closes that connection when the Pi r
 
 ### Install from one URL
 
-When a user supplies an MCP endpoint URL, the agent can complete setup through the gateway without editing configuration by hand:
+Install an MCP endpoint without editing configuration:
 
 ```js
 mcp({ action: "install", url: "https://example.com/mcp" })
 ```
 
-The install action validates the endpoint, reuses a server already configured at the same URL or derives a stable name from the hostname, connects it in the current runtime, and persists it to Pi's global MCP config. Pass `server` to choose a name or `target: "project"` to write `.mcp.json` in the current project instead. Unsafe URLs, name collisions, and endpoints that fail MCP connection validation are not persisted.
+Install validates and connects the endpoint. New entries use a name derived from the hostname and are saved to Pi's global MCP config; existing URL entries are reused without rewriting. Pass `server` to choose a name or `target: "project"` to save to the project's `.mcp.json`. Unsafe URLs, name collisions, and failed connections are not persisted.
 
 In exclusive config mode, a project target must be the active config path; otherwise use the global target. URL install cannot promote runtime-registered servers: save their complete definitions manually so required headers and transport/auth settings are retained.
 
@@ -880,7 +880,7 @@ Servers that provide usage guidance via the MCP `instructions` field surface it 
 
 If `settings.autoAuth` is `true`, `mcp({ connect: ... })`, `mcp({ tool: ... })`, and direct tool calls automatically run OAuth when needed and retry once.
 
-In interactive sessions, you can also authenticate from `/mcp` with `ctrl+a` or Enter on a server that needs auth. The proxy tool's `auth-start` action opens and watches reachable loopback flows automatically. In remote/headless sessions, or for pre-registered HTTPS callbacks that the adapter cannot observe, use `auth-complete` to paste the full redirect URL back into Pi. `/mcp-auth` without a server only opens a picker in the interactive UI.
+In interactive sessions, you can also authenticate from `/mcp` with `ctrl+a` or Enter on a server that needs auth. `/mcp-auth` without a server only opens a picker in the interactive UI. For gateway authorization and manual callback completion, see [Remote/headless OAuth](#remoteheadless-oauth).
 
 ### MCP output schemas
 

@@ -1303,9 +1303,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       await rollback();
       throw error;
     }
-    const connectDetails = connectResult.details as { error?: string } | undefined;
+    const connectError = connectResult.details?.error;
     const connectText = connectResult.content.find((content) => content.type === "text")?.text;
-    if (connectDetails?.error && connectDetails.error !== "auth_required") {
+    if (connectError && connectError !== "auth_required") {
       await rollback();
       return {
         ...connectResult,
@@ -1338,11 +1338,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       syncPromptCommands();
     }
 
-    if (connectDetails?.error === "auth_required") {
-      const authResult = signal
-        ? await executeAuthStart(targetState, serverName, signal)
-        : await executeAuthStart(targetState, serverName);
-      const authDetails = authResult.details as { error?: string } | undefined;
+    if (connectError === "auth_required") {
+      const authResult = await executeAuthStart(targetState, serverName, signal);
+      const authError = authResult.details?.error;
       const authText = authResult.content.find((content) => content.type === "text")?.text;
       return {
         ...connectResult,
@@ -1352,11 +1350,11 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         }],
         details: {
           mode: "install",
-          status: authDetails?.error ? "auth_start_failed" : "awaiting_auth",
+          status: authError ? "auth_start_failed" : "awaiting_auth",
           server: serverName,
           url: normalized.url,
           ...(provisional ? { path: destination } : {}),
-          ...(authDetails?.error ? { error: authDetails.error } : {}),
+          ...(authError ? { error: authError } : {}),
         },
       };
     }
