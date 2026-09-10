@@ -1262,7 +1262,6 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     const persistedEntry: ServerEntry = { url: normalized.url };
     const runtimeEntry: ServerEntry = existing ?? { ...persistedEntry, directTools: false };
     const provisional = existing === undefined;
-    const persistenceRequired = provisional;
     const restoreMetadata = [targetState.toolMetadata, targetState.promptMetadata, targetState.serverInstructions,
       targetState.resourceCounts, targetState.directToolCounts].map((map) => {
       const previous = map.get(serverName);
@@ -1316,14 +1315,12 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       };
     }
 
-    let persistedPath: string | undefined;
-    if (persistenceRequired) {
-      persistedPath = destination;
+    if (provisional) {
       try {
-        await withFileMutationQueue(persistedPath, async () => {
+        await withFileMutationQueue(destination, async () => {
           signal?.throwIfAborted();
           installOwner?.throwIfInactive();
-          writeSharedServerEntry(persistedPath!, serverName, persistedEntry);
+          writeSharedServerEntry(destination, serverName, persistedEntry);
         });
       } catch (error) {
         await rollback();
@@ -1333,10 +1330,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           details: { mode: "install", error: "persistence_failed", server: serverName, url: normalized.url, message },
         };
       }
-    }
-
-    targetState.provisionalInstalls?.delete(serverName);
-    if (provisional) {
+      targetState.provisionalInstalls?.delete(serverName);
       try {
         updateMetadataCache(targetState, serverName);
       } catch (error) {
@@ -1355,14 +1349,14 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         ...connectResult,
         content: [{
           type: "text" as const,
-          text: `${persistenceRequired ? "Installed" : "Found"} MCP server "${serverName}" at ${normalized.url}.\n\n${authText ?? "OAuth authorization is required."}`,
+          text: `${provisional ? "Installed" : "Found"} MCP server "${serverName}" at ${normalized.url}.\n\n${authText ?? "OAuth authorization is required."}`,
         }],
         details: {
           mode: "install",
           status: authDetails?.error ? "auth_start_failed" : "awaiting_auth",
           server: serverName,
           url: normalized.url,
-          ...(persistedPath ? { path: persistedPath } : {}),
+          ...(provisional ? { path: destination } : {}),
           ...(authDetails?.error ? { error: authDetails.error } : {}),
         },
       };
@@ -1372,14 +1366,14 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       ...connectResult,
       content: [{
         type: "text" as const,
-        text: `${persistenceRequired ? "Installed and connected" : "Already installed; connected"} MCP server "${serverName}" at ${normalized.url}.\n\n${connectText ?? ""}`.trim(),
+        text: `${provisional ? "Installed and connected" : "Already installed; connected"} MCP server "${serverName}" at ${normalized.url}.\n\n${connectText ?? ""}`.trim(),
       }],
       details: {
         mode: "install",
         status: "connected",
         server: serverName,
         url: normalized.url,
-        ...(persistedPath ? { path: persistedPath } : {}),
+        ...(provisional ? { path: destination } : {}),
       },
     };
   }

@@ -927,6 +927,7 @@ describe("mcpAdapter session lifecycle", () => {
       { url: "https://demo.example.com/mcp" },
     );
     expect(result.details).toMatchObject({ mode: "install", status: "connected", server: "demo" });
+    expect(result.details.path).toBe("/tmp/agent/mcp.json");
   });
 
   it("persists an OAuth MCP URL and starts watched authorization", async () => {
@@ -962,6 +963,7 @@ describe("mcpAdapter session lifecycle", () => {
     );
     expect(mocks.executeAuthStart).toHaveBeenCalledWith(state, "forex");
     expect(result.details).toMatchObject({ mode: "install", status: "awaiting_auth", server: "forex" });
+    expect(result.details.path).toBe("/tmp/project/.mcp.json");
   });
 
   it("reuses the configured name for an already installed URL", async () => {
@@ -988,6 +990,7 @@ describe("mcpAdapter session lifecycle", () => {
     expect(mocks.executeConnect).toHaveBeenCalledWith(state, "forex", undefined);
     expect(mocks.writeSharedServerEntry).not.toHaveBeenCalled();
     expect(result.details).toMatchObject({ mode: "install", status: "connected", server: "forex" });
+    expect(result.details).not.toHaveProperty("path");
   });
 
   it("rejects an inactive project target before provisional registration or connection", async () => {
