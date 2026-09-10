@@ -166,8 +166,10 @@ function ensureBackgroundAuthWatcher(
     openAuthorizationUrl: state.openBrowser,
   };
   const watcher = authenticate(serverName, serverUrl, definition, authOptions).then(async (status) => {
+    throwIfAborted(state.owner.signal);
     if (status !== "authenticated") throw new Error(`OAuth authentication ended with status: ${status}`);
     await state.manager.close(serverName);
+    throwIfAborted(state.owner.signal);
     clearFailure(state, serverName, "auth-background-complete");
     updateStatusBar(state);
     emitAuthStatus(
@@ -186,6 +188,7 @@ function ensureBackgroundAuthWatcher(
     } catch (statusError) {
       if (isAbortError(statusError, state.owner.signal)) return;
     }
+    if (state.owner.signal.aborted) return;
     emitAuthStatus(
       state,
       serverName,

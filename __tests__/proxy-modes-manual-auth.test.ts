@@ -120,6 +120,40 @@ describe("manual OAuth proxy actions", () => {
     );
   });
 
+  it.each(["before-close", "during-close"])("does not publish background completion after owner cancellation %s", async (boundary) => {
+    const controller = new AbortController();
+    let finishAuth!: (status: string) => void;
+    mocks.authenticate.mockImplementationOnce(() => new Promise<string>((resolve) => { finishAuth = resolve; }));
+    const { executeAuthStart } = await import("../proxy-modes.ts");
+    const state = createState({ owner: { signal: controller.signal } });
+    if (boundary === "during-close") state.manager.close.mockImplementation(async () => { controller.abort(); });
+
+    await executeAuthStart(state, "demo");
+    if (boundary === "before-close") controller.abort();
+    finishAuth("authenticated");
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    if (boundary === "before-close") expect(state.manager.close).not.toHaveBeenCalled();
+    expect(mocks.clearFailure).not.toHaveBeenCalled();
+    expect(mocks.updateStatusBar).not.toHaveBeenCalled();
+    expect(state.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not publish failure when the owner stops during the credential recheck", async () => {
+    const controller = new AbortController();
+    mocks.authenticate.mockRejectedValueOnce(new Error("authentication failed"));
+    mocks.getAuthStatus.mockImplementationOnce(async () => {
+      controller.abort();
+      return "not_authenticated";
+    });
+    const { executeAuthStart } = await import("../proxy-modes.ts");
+    const state = createState({ owner: { signal: controller.signal } });
+    await executeAuthStart(state, "demo");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mocks.getAuthStatus).toHaveBeenCalled();
+    expect(state.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("deduplicates repeated background callback watchers", async () => {
     const { executeAuthStart } = await import("../proxy-modes.ts");
     const state = createState();

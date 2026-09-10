@@ -1271,14 +1271,6 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       };
     });
     const hadLivePrompts = targetState.promptMetadataLive.has(serverName);
-    if (provisional) {
-      (targetState.provisionalInstalls ??= new Set()).add(serverName);
-      targetState.config.mcpServers[serverName] = runtimeEntry;
-      attachRuntimeServerLifecycle(targetState, serverName, runtimeEntry);
-      syncToolSurface();
-      updateStatusBar(targetState);
-    }
-
     const rollback = async (): Promise<void> => {
       if (!provisional || targetState.config.mcpServers[serverName] !== runtimeEntry) return;
       delete targetState.config.mcpServers[serverName];
@@ -1297,6 +1289,13 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 
     let connectResult: Awaited<ReturnType<typeof connectAndReport>>;
     try {
+      if (provisional) {
+        (targetState.provisionalInstalls ??= new Set()).add(serverName);
+        targetState.config.mcpServers[serverName] = runtimeEntry;
+        attachRuntimeServerLifecycle(targetState, serverName, runtimeEntry);
+        syncToolSurface();
+        updateStatusBar(targetState);
+      }
       connectResult = await connectAndReport(targetState, serverName, signal);
       signal?.throwIfAborted();
       installOwner?.throwIfInactive();

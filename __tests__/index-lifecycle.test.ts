@@ -1032,12 +1032,13 @@ describe("mcpAdapter session lifecycle", () => {
     expect(state.manager.close).not.toHaveBeenCalled();
   });
 
-  it.each(["pre-aborted", "connect-throws", "aborted-after-connect"])("rolls back cancellation and exceptional exits: %s", async (scenario) => {
+  it.each(["pre-aborted", "registration-throws", "connect-throws", "aborted-after-connect"])("rolls back cancellation and exceptional exits: %s", async (scenario) => {
     const state = createState();
     mocks.initializeMcp.mockResolvedValue(state);
     const controller = new AbortController();
     const error = new Error("cancelled");
     if (scenario === "pre-aborted") controller.abort(error);
+    if (scenario === "registration-throws") state.lifecycle.registerServer.mockImplementation(() => { throw error; });
     mocks.executeConnect.mockImplementation(async () => {
       state.toolMetadata.set("demo", []);
       if (scenario === "connect-throws") throw error;
