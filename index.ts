@@ -8,7 +8,7 @@ import type { TSchema } from "typebox";
 import { showStatus, showTools, showPrompts, reconnectServer, reconnectServers, authenticateServer, logoutServer, manageBearerToken, openMcpAuthPanel, openMcpPanel, openMcpSetup } from "./commands.ts";
 import { cloneMcpConfig, discoverConfiguredClaudePluginSkills, getPiGlobalConfigPath, getProjectConfigPath, loadMcpConfig, resolveConfiguredClaudePluginMcp, writeProjectServerDisabledOverride, writeSharedServerEntry } from "./config.ts";
 import { buildProxyDescription, createDirectToolExecutor, getMissingConfiguredDirectToolServers, prepareDirectToolArguments, resolveDirectTools } from "./direct-tools.ts";
-import { clearFailure, flushMetadataCache, initializeMcp, updateStatusBar } from "./init.ts";
+import { clearFailure, flushMetadataCache, initializeMcp, updateMetadataCache, updateStatusBar } from "./init.ts";
 import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
 import { loadMetadataCache, parseDirectToolSelectors, type MetadataCache } from "./metadata-cache.ts";
 import { createPromptCommand, resolveCachedPrompts } from "./prompts.ts";
@@ -555,7 +555,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   }
 
   function syncPromptCommands(): void {
-    registerPromptCommands([...(state?.promptMetadata?.values() ?? [])].flat());
+    registerPromptCommands([...(state?.promptMetadata?.entries() ?? [])]
+      .filter(([name]) => !state?.provisionalInstalls?.has(name))
+      .flatMap(([, prompts]) => prompts));
   }
 
   registerPromptCommands(resolveCachedPrompts(earlyConfig));
@@ -1167,6 +1169,24 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     });
   }
 
+  async function connectAndReport(targetState: McpExtensionState, serverName: string, signal?: AbortSignal, ctx?: ExtensionContext): Promise<Awaited<ReturnType<typeof executeConnect>> & { addedToolNames?: string[] }> {
+    const directToolsBefore = new Map([...registeredDirectTools.keys()].map((name) => [name, registeredDirectToolVersions.get(name) ?? 0]));
+    const result = await executeConnect(targetState, serverName, signal);
+    if (!directToolsFrozen) syncToolSurface(ctx);
+    const reportedNames = reportedDirectToolNamesByServer.get(serverName) ?? new Set<string>();
+    // Attribute only this server's new definitions; search-mode tools load on search, not connect.
+    const addedToolNames = [...registeredDirectTools.keys()].filter(
+      (name) => (!directToolsBefore.has(name) || (registeredDirectToolVersions.get(name) ?? 0) !== directToolsBefore.get(name))
+        && registeredDirectToolServers.get(name) === serverName
+        && !reportedNames.has(name)
+        && !lazyDirectTools.has(name),
+    );
+    if (addedToolNames.length === 0) return result;
+    for (const name of addedToolNames) reportedNames.add(name);
+    reportedDirectToolNamesByServer.set(serverName, reportedNames);
+    return { ...result, addedToolNames };
+  }
+
   async function executeInstall(
     targetState: McpExtensionState,
     rawUrl: string | undefined,
@@ -1175,6 +1195,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     cwd: string,
     signal?: AbortSignal,
   ) {
+    const installOwner = currentOwner;
+    signal?.throwIfAborted();
+    installOwner?.throwIfInactive();
     if (programmaticConfig) {
       return {
         content: [{ type: "text" as const, text: "MCP install is unavailable when the adapter uses programmatic configuration." }],
@@ -1185,6 +1208,15 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       return {
         content: [{ type: "text" as const, text: "MCP install target must be 'global' or 'project'." }],
         details: { mode: "install", error: "invalid_target" },
+      };
+    }
+
+    const destination = target === "project" ? getProjectConfigPath(cwd) : getPiGlobalConfigPath(earlyConfigPath);
+    if (target === "project" && process.env.PI_MCP_CONFIG_MODE?.trim().toLowerCase() === "exclusive"
+      && resolve(destination) !== resolve(getPiGlobalConfigPath(earlyConfigPath))) {
+      return {
+        content: [{ type: "text" as const, text: "Project installation is unavailable in exclusive config mode; use the global target." }],
+        details: { mode: "install", error: "inactive_target" },
       };
     }
 
@@ -1214,11 +1246,34 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       };
     }
 
+    if (targetState.provisionalInstalls?.has(serverName)) {
+      return {
+        content: [{ type: "text" as const, text: `MCP server "${serverName}" is still being installed. Retry after that installation finishes.` }],
+        details: { mode: "install", error: "install_in_progress", server: serverName },
+      };
+    }
+    if (runtimeServers.has(serverName)) {
+      return {
+        content: [{ type: "text" as const, text: `Runtime MCP server "${serverName}" cannot be promoted by URL install. Save its full definition manually.` }],
+        details: { mode: "install", error: "runtime_promotion_unsupported", server: serverName },
+      };
+    }
+
     const persistedEntry: ServerEntry = { url: normalized.url };
     const runtimeEntry: ServerEntry = existing ?? { ...persistedEntry, directTools: false };
     const provisional = existing === undefined;
-    const persistenceRequired = provisional || runtimeServers.has(serverName);
+    const persistenceRequired = provisional;
+    const restoreMetadata = [targetState.toolMetadata, targetState.promptMetadata, targetState.serverInstructions,
+      targetState.resourceCounts, targetState.directToolCounts].map((map) => {
+      const previous = map.get(serverName);
+      return () => {
+        if (previous === undefined) map.delete(serverName);
+        else (map as Map<string, unknown>).set(serverName, previous);
+      };
+    });
+    const hadLivePrompts = targetState.promptMetadataLive.has(serverName);
     if (provisional) {
+      (targetState.provisionalInstalls ??= new Set()).add(serverName);
       targetState.config.mcpServers[serverName] = runtimeEntry;
       attachRuntimeServerLifecycle(targetState, serverName, runtimeEntry);
       syncToolSurface();
@@ -1229,20 +1284,33 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       if (!provisional || targetState.config.mcpServers[serverName] !== runtimeEntry) return;
       delete targetState.config.mcpServers[serverName];
       targetState.lifecycle.unregisterServer(serverName);
-      await targetState.manager.close(serverName);
-      clearFailure(targetState, serverName, "install-rollback");
-      syncToolSurface();
-      updateStatusBar(targetState);
+      try {
+        await targetState.manager.close(serverName);
+      } finally {
+        targetState.provisionalInstalls?.delete(serverName);
+        for (const restore of restoreMetadata) restore();
+        if (!hadLivePrompts) targetState.promptMetadataLive.delete(serverName);
+        clearFailure(targetState, serverName, "install-rollback");
+        syncToolSurface();
+        updateStatusBar(targetState);
+      }
     };
 
-    const connectResult = signal
-      ? await executeConnect(targetState, serverName, signal)
-      : await executeConnect(targetState, serverName);
+    let connectResult: Awaited<ReturnType<typeof connectAndReport>>;
+    try {
+      connectResult = await connectAndReport(targetState, serverName, signal);
+      signal?.throwIfAborted();
+      installOwner?.throwIfInactive();
+    } catch (error) {
+      await rollback();
+      throw error;
+    }
     const connectDetails = connectResult.details as { error?: string } | undefined;
     const connectText = connectResult.content.find((content) => content.type === "text")?.text;
     if (connectDetails?.error && connectDetails.error !== "auth_required") {
       await rollback();
       return {
+        ...connectResult,
         content: [{ type: "text" as const, text: `MCP installation validation failed for "${serverName}". ${connectText ?? "Connection failed."}` }],
         details: { mode: "install", error: "validation_failed", server: serverName, url: normalized.url },
       };
@@ -1250,9 +1318,11 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
 
     let persistedPath: string | undefined;
     if (persistenceRequired) {
-      persistedPath = target === "project" ? getProjectConfigPath(cwd) : getPiGlobalConfigPath(earlyConfigPath);
+      persistedPath = destination;
       try {
         await withFileMutationQueue(persistedPath, async () => {
+          signal?.throwIfAborted();
+          installOwner?.throwIfInactive();
           writeSharedServerEntry(persistedPath!, serverName, persistedEntry);
         });
       } catch (error) {
@@ -1265,6 +1335,16 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       }
     }
 
+    targetState.provisionalInstalls?.delete(serverName);
+    if (provisional) {
+      try {
+        updateMetadataCache(targetState, serverName);
+      } catch (error) {
+        logger.warn(`MCP: installed "${serverName}" but could not cache metadata: ${error}`);
+      }
+      syncPromptCommands();
+    }
+
     if (connectDetails?.error === "auth_required") {
       const authResult = signal
         ? await executeAuthStart(targetState, serverName, signal)
@@ -1272,6 +1352,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       const authDetails = authResult.details as { error?: string } | undefined;
       const authText = authResult.content.find((content) => content.type === "text")?.text;
       return {
+        ...connectResult,
         content: [{
           type: "text" as const,
           text: `${persistenceRequired ? "Installed" : "Found"} MCP server "${serverName}" at ${normalized.url}.\n\n${authText ?? "OAuth authorization is required."}`,
@@ -1288,6 +1369,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     }
 
     return {
+      ...connectResult,
       content: [{
         type: "text" as const,
         text: `${persistenceRequired ? "Installed and connected" : "Already installed; connected"} MCP server "${serverName}" at ${normalized.url}.\n\n${connectText ?? ""}`.trim(),
@@ -1461,30 +1543,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
           return executeCall(state, params.tool, parsedArgs, params.server, getPiTools, signal);
         }
         if (params.connect) {
-          // Direct tools discovered by this connect are registered by the
-          // metadata-update hook inside executeConnect or by the sync below.
-          // Report them on the result so Pi treats this transcript point as
-          // their load point instead of relying on an active-tool rewrite.
-          // Only this server's tools are attributed: another server's refresh
-          // or a concurrent connect can register tools while this one awaits.
-          const directToolsBefore = new Set(registeredDirectTools.keys());
-          const directToolVersionsBefore = new Map([...registeredDirectTools.keys()].map((name) => [name, registeredDirectToolVersions.get(name) ?? 0]));
-          const result = await executeConnect(state, params.connect, signal);
-          if (!directToolsFrozen) syncToolSurface(_ctx as ExtensionContext);
-          const reportedNames = reportedDirectToolNamesByServer.get(params.connect) ?? new Set<string>();
-          // A search-mode tool is registered but held inactive; it is not
-          // loaded at this point, so it must not be reported as such — a
-          // search that matches it is its load point.
-          const addedToolNames = [...registeredDirectTools.keys()].filter(
-            (name) => (!directToolsBefore.has(name) || (registeredDirectToolVersions.get(name) ?? 0) !== (directToolVersionsBefore.get(name) ?? 0))
-              && registeredDirectToolServers.get(name) === params.connect
-              && !reportedNames.has(name)
-              && !lazyDirectTools.has(name),
-          );
-          if (addedToolNames.length === 0) return result;
-          for (const name of addedToolNames) reportedNames.add(name);
-          reportedDirectToolNamesByServer.set(params.connect, reportedNames);
-          return { ...result, addedToolNames };
+          return connectAndReport(state, params.connect, signal, _ctx as ExtensionContext);
         }
         if (params.describe) {
           return executeDescribe(state, params.describe);
